@@ -1,0 +1,28 @@
+//cinexcp.cpp
+#include <iostream>
+#include <exception>
+
+int main(void)
+{
+	using namespace std;
+	//have failbit cause an exception to be throown
+	cin.exceptions(ios_base::failbit);
+	cout << "Enter numbers: ";
+	int sum = 0;
+	int input;
+	try
+	{
+		while (cin >> input)
+			sum += input;
+	}
+	catch (ios_base::failure & bf)
+	{
+		cout << bf.what() << endl;
+		cout << "O! the horror!\n";
+	}
+
+	cout << "Last value entered = " << input << endl;
+	cout << "Sum = " << sum << endl;
+
+	return 0;
+}

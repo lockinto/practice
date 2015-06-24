@@ -1,0 +1,735 @@
+!
+! SYS_SIZE is the number of clicks (16 bytes) to be loaded.
+! 0x3000 is 0x30000 bytes = 196kB, more than enough for current
+! versions of linux
+!
+SYSSIZE = 0x3000
+!
+!	bootsect.s		(C) 1991 Linus Torvalds
+!
+! bootsect.s is loaded at 0x7c00 by the bios-startup routines, and moves
+! iself out of the way to address 0x90000, and jumps there.
+!
+! It then loads 'setup' directly after itself (0x90200), and the system
+! at 0x10000, using BIOS interrupts. 
+!
+! NOTE! currently system is at most 8*65536 bytes long. This should be no
+! problem, even in the future. I want to keep it simple. This 512 kB
+! kernel size should be enough, especially as this doesn't contain the
+! buffer cache as in minix
+!
+! The loader has been made as simple as possible, and continuos
+! read errors will result in a unbreakable loop. Reboot by hand. It
+! loads pretty fast by getting whole sectors at a time whenever possible.
+
+.globl begtext, begdata, begbss, endtext, enddata, endbss
+.text
+begtext:
+.data
+begdata:
+.bss
+begbss:
+.text
+
+SETUPLEN = 4				! nr of setup-sectors
+BOOTSEG  = 0x07c0			! original address of boot-sector
+INITSEG  = 0x9000			! we move boot here - out of the way
+SETUPSEG = 0x9020			! setup starts here
+SYSSEG   = 0x1000			! system loaded at 0x10000 (65536).
+ENDSEG   = SYSSEG + SYSSIZE		! where to stop loading
+
+! ROOT_DEV:	0x000 - same type of floppy as boot.
+!		0x301 - first partition on first drive etc
+ROOT_DEV = 0x306
+
+entry _start
+_start:
+	mov	ax,#BOOTSEG
+	mov	ds,ax
+	mov	ax,#INITSEG
+	mov	es,ax
+	mov	cx,#256
+	sub	si,si
+	sub	di,di
+	rep
+	movw
+	jmpi	go,INITSEG
+go:	mov	ax,cs
+	mov	ds,ax
+	mov	es,ax
+! put stack at 0x9ff00.
+	mov	ss,ax
+	mov	sp,#0xFF00		! arbitrary value >>512
+
+! load the setup-sectors directly after the bootblock.
+! Note that 'es' is already set up.
+
+load_setup:
+	mov	dx,#0x0000		! drive 0, head 0
+	mov	cx,#0x0002		! sector 2, track 0
+	mov	bx,#0x0200		! address = 512, in INITSEG
+	mov	ax,#0x0200+SETUPLEN	! service 2, nr of sectors
+	int	0x13			! read it
+	jnc	ok_load_setup		! ok - continue
+	mov	dx,#0x0000
+	mov	ax,#0x0000		! reset the diskette
+	int	0x13
+	j	load_setup
+
+ok_load_setup:
+
+! Get disk drive parameters, specifically nr of sectors/track
+
+	mov	dl,#0x00
+	mov	ax,#0x0800		! AH=8 is get drive parameters
+	int	0x13
+	mov	ch,#0x00
+	seg cs
+	mov	sectors,cx
+	mov	ax,#INITSEG
+	mov	es,ax
+
+! Print some inane message
+
+	mov	ah,#0x03		! read cursor pos
+	xor	bh,bh
+	int	0x10
+	
+	mov	cx,#24
+	mov	bx,#0x0007		! page 0, attribute 7 (normal)
+	mov	bp,#msg1
+	mov	ax,#0x1301		! write string, move cursor
+	int	0x10
+
+! ok, we've written the message, now
+! we want to load the system (at 0x10000)
+
+	mov	ax,#SYSSEG
+	mov	es,ax		! segment of 0x010000
+	call	read_it
+	call	kill_motor
+
+! After that we check which root-device to use. If the device is
+! defined (!= 0), nothing is done and the given device is used.
+! Otherwise, either /dev/PS0 (2,28) or /dev/at0 (2,8), depending
+! on the number of sectors that the BIOS reports currently.
+
+	seg cs
+	mov	ax,root_dev
+	cmp	ax,#0
+	jne	root_defined
+	seg cs
+	mov	bx,sectors
+	mov	ax,#0x0208		! /dev/ps0 - 1.2Mb
+	cmp	bx,#15
+	je	root_defined
+	mov	ax,#0x021c		! /dev/PS0 - 1.44Mb
+	cmp	bx,#18
+	je	root_defined
+undef_root:
+	jmp undef_root
+root_defined:
+	seg cs
+	mov	root_dev,ax
+
+! after that (everyting loaded), we jump to
+! the setup-routine loaded directly after
+! the bootblock:
+
+	jmpi	0,SETUPSEG
+
+! This routine loads the system at address 0x10000, making sure
+! no 64kB boundaries are crossed. We try to load it as fast as
+! possible, loading whole tracks whenever we can.
+!
+! in:	es - starting address segment (normally 0x1000)
+!
+sread:	.word 1+SETUPLEN	! sectors read of current track
+head:	.word 0			! current head
+track:	.word 0			! current track
+
+read_it:
+	mov ax,es
+	test ax,#0x0fff
+die:	jne die			! es must be at 64kB boundary
+	xor bx,bx		! bx is starting address within segment
+rp_read:
+	mov ax,es
+	cmp ax,#ENDSEG		! have we loaded all yet?
+	jb ok1_read
+	ret
+ok1_read:
+	seg cs
+	mov ax,sectors
+	sub ax,sread
+	mov cx,ax
+	shl cx,#9
+	add cx,bx
+	jnc ok2_read
+	je ok2_read
+	xor ax,ax
+	sub ax,bx
+	shr ax,#9
+ok2_read:
+	call read_track
+	mov cx,ax
+	add ax,sread
+	seg cs
+	cmp ax,sectors
+	jne ok3_read
+	mov ax,#1
+	sub ax,head
+	jne ok4_read
+	inc track
+ok4_read:
+	mov head,ax
+	xor ax,ax
+ok3_read:
+	mov sread,ax
+	shl cx,#9
+	add bx,cx
+	jnc rp_read
+	mov ax,es
+	add ax,#0x1000
+	mov es,ax
+	xor bx,bx
+	jmp rp_read
+
+read_track:
+	push ax
+	push bx
+	push cx
+	push dx
+	mov dx,track
+	mov cx,sread
+	inc cx
+	mov ch,dl
+	mov dx,head
+	mov dh,dl
+	mov dl,#0
+	and dx,#0x0100
+	mov ah,#2
+	int 0x13
+	jc bad_rt
+	pop dx
+	pop cx
+	pop bx
+	pop ax
+	ret
+bad_rt:	mov ax,#0
+	mov dx,#0
+	int 0x13
+	pop dx
+	pop cx
+	pop bx
+	pop ax
+	jmp read_track
+
+!/*
+! * This procedure turns off the floppy drive motor, so
+! * that we enter the kernel in a known state, and
+! * don't have to worry about it later.
+! */
+kill_motor:
+	push dx
+	mov dx,#0x3f2
+	mov al,#0
+	outb
+	pop dx
+	ret
+
+sectors:
+	.word 0
+
+msg1:
+	.byte 13,10
+	.ascii "Loading system ..."
+	.byte 13,10,13,10
+
+.org 508
+root_dev:
+	.word ROOT_DEV
+boot_flag:
+	.word 0xAA55
+
+.text
+endtext:
+.data
+enddata:
+.bss
+endbss:
+
+
+
+!
+!	setup.s		(C) 1991 Linus Torvalds
+!
+! setup.s is responsible for getting the system data from the BIOS,
+! and putting them into the appropriate places in system memory.
+! both setup.s and system has been loaded by the bootblock.
+!
+! This code asks the bios for memory/disk/other parameters, and
+! puts them in a "safe" place: 0x90000-0x901FF, ie where the
+! boot-block used to be. It is then up to the protected mode
+! system to read them from there before the area is overwritten
+! for buffer-blocks.
+!
+
+! NOTE! These had better be the same as in bootsect.s!
+
+INITSEG  = 0x9000	! we move boot here - out of the way
+SYSSEG   = 0x1000	! system loaded at 0x10000 (65536).
+SETUPSEG = 0x9020	! this is the current segment
+
+.globl begtext, begdata, begbss, endtext, enddata, endbss
+.text
+begtext:
+.data
+begdata:
+.bss
+begbss:
+.text
+
+entry start
+start:
+
+! ok, the read went well so we get current cursor position and save it for
+! posterity.
+
+	mov	ax,#INITSEG	! this is done in bootsect already, but...
+	mov	ds,ax
+	mov	ah,#0x03	! read cursor pos
+	xor	bh,bh
+	int	0x10		! save it in known place, con_init fetches
+	mov	[0],dx		! it from 0x90000.
+! Get memory size (extended mem, kB)
+
+	mov	ah,#0x88
+	int	0x15
+	mov	[2],ax
+
+! Get video-card data:
+
+	mov	ah,#0x0f
+	int	0x10
+	mov	[4],bx		! bh = display page
+	mov	[6],ax		! al = video mode, ah = window width
+
+! check for EGA/VGA and some config parameters
+
+	mov	ah,#0x12
+	mov	bl,#0x10
+	int	0x10
+	mov	[8],ax
+	mov	[10],bx
+	mov	[12],cx
+
+! Get hd0 data
+
+	mov	ax,#0x0000
+	mov	ds,ax
+	lds	si,[4*0x41]
+	mov	ax,#INITSEG
+	mov	es,ax
+	mov	di,#0x0080
+	mov	cx,#0x10
+	rep
+	movsb
+
+! Get hd1 data
+
+	mov	ax,#0x0000
+	mov	ds,ax
+	lds	si,[4*0x46]
+	mov	ax,#INITSEG
+	mov	es,ax
+	mov	di,#0x0090
+	mov	cx,#0x10
+	rep
+	movsb
+
+! Check that there IS a hd1 :-)
+
+	mov	ax,#0x01500
+	mov	dl,#0x81
+	int	0x13
+	jc	no_disk1
+	cmp	ah,#3
+	je	is_disk1
+no_disk1:
+	mov	ax,#INITSEG
+	mov	es,ax
+	mov	di,#0x0090
+	mov	cx,#0x10
+	mov	ax,#0x00
+	rep
+	stosb
+is_disk1:
+
+! now we want to move to protected mode ...
+
+	cli			! no interrupts allowed !
+
+! first we move the system to it's rightful place
+
+	mov	ax,#0x0000
+	cld			! 'direction'=0, movs moves forward
+do_move:
+	mov	es,ax		! destination segment
+	add	ax,#0x1000
+	cmp	ax,#0x9000
+	jz	end_move
+	mov	ds,ax		! source segment
+	sub	di,di
+	sub	si,si
+	mov 	cx,#0x8000
+	rep
+	movsw
+	jmp	do_move
+
+! then we load the segment descriptors
+
+end_move:
+	mov	ax,#SETUPSEG	! right, forgot this at first. didn't work :-)
+	mov	ds,ax
+	lidt	idt_48		! load idt with 0,0
+	lgdt	gdt_48		! load gdt with whatever appropriate
+
+! that was painless, now we enable A20
+
+	call	empty_8042
+	mov	al,#0xD1		! command write
+	out	#0x64,al
+	call	empty_8042
+	mov	al,#0xDF		! A20 on
+	out	#0x60,al
+	call	empty_8042
+
+! well, that went ok, I hope. Now we have to reprogram the interrupts :-(
+! we put them right after the intel-reserved hardware interrupts, at
+! int 0x20-0x2F. There they won't mess up anything. Sadly IBM really
+! messed this up with the original PC, and they haven't been able to
+! rectify it afterwards. Thus the bios puts interrupts at 0x08-0x0f,
+! which is used for the internal hardware interrupts as well. We just
+! have to reprogram the 8259's, and it isn't fun.
+
+	mov	al,#0x11		! initialization sequence
+	out	#0x20,al		! send it to 8259A-1
+	.word	0x00eb,0x00eb		! jmp $+2, jmp $+2
+	out	#0xA0,al		! and to 8259A-2
+	.word	0x00eb,0x00eb
+	mov	al,#0x20		! start of hardware int's (0x20)
+	out	#0x21,al
+	.word	0x00eb,0x00eb
+	mov	al,#0x28		! start of hardware int's 2 (0x28)
+	out	#0xA1,al
+	.word	0x00eb,0x00eb
+	mov	al,#0x04		! 8259-1 is master
+	out	#0x21,al
+	.word	0x00eb,0x00eb
+	mov	al,#0x02		! 8259-2 is slave
+	out	#0xA1,al
+	.word	0x00eb,0x00eb
+	mov	al,#0x01		! 8086 mode for both
+	out	#0x21,al
+	.word	0x00eb,0x00eb
+	out	#0xA1,al
+	.word	0x00eb,0x00eb
+	mov	al,#0xFF		! mask off all interrupts for now
+	out	#0x21,al
+	.word	0x00eb,0x00eb
+	out	#0xA1,al
+
+! well, that certainly wasn't fun :-(. Hopefully it works, and we don't
+! need no steenking BIOS anyway (except for the initial loading :-).
+! The BIOS-routine wants lots of unnecessary data, and it's less
+! "interesting" anyway. This is how REAL programmers do it.
+!
+! Well, now's the time to actually move into protected mode. To make
+! things as simple as possible, we do no register set-up or anything,
+! we let the gnu-compiled 32-bit programs do that. We just jump to
+! absolute address 0x00000, in 32-bit protected mode.
+	mov	ax,#0x0001	! protected mode (PE) bit
+	lmsw	ax		! This is it!
+	jmpi	0,8		! jmp offset 0 of segment 8 (cs)
+
+! This routine checks that the keyboard command queue is empty
+! No timeout is used - if this hangs there is something wrong with
+! the machine, and we probably couldn't proceed anyway.
+empty_8042:
+	.word	0x00eb,0x00eb
+	in	al,#0x64	! 8042 status port
+	test	al,#2		! is input buffer full?
+	jnz	empty_8042	! yes - loop
+	ret
+
+gdt:
+	.word	0,0,0,0		! dummy
+
+	.word	0x07FF		! 8Mb - limit=2047 (2048*4096=8Mb)
+	.word	0x0000		! base address=0
+	.word	0x9A00		! code read/exec
+	.word	0x00C0		! granularity=4096, 386
+
+	.word	0x07FF		! 8Mb - limit=2047 (2048*4096=8Mb)
+	.word	0x0000		! base address=0
+	.word	0x9200		! data read/write
+	.word	0x00C0		! granularity=4096, 386
+
+idt_48:
+	.word	0			! idt limit=0
+	.word	0,0			! idt base=0L
+
+gdt_48:
+	.word	0x800		! gdt limit=2048, 256 GDT entries
+	.word	512+gdt,0x9	! gdt base = 0X9xxxx
+	
+.text
+endtext:
+.data
+enddata:
+.bss
+endbss:
+
+
+
+/*
+ *  linux/boot/head.s
+ *
+ *  (C) 1991  Linus Torvalds
+ */
+
+/*
+ *  head.s contains the 32-bit startup code.
+ *
+ * NOTE!!! Startup happens at absolute address 0x00000000, which is also where
+ * the page directory will exist. The startup code will be overwritten by
+ * the page directory.
+ */
+.text
+.globl idt,gdt,pg_dir,tmp_floppy_area
+pg_dir:
+.globl startup_32
+startup_32:
+	movl $0x10,%eax
+	mov %ax,%ds
+	mov %ax,%es
+	mov %ax,%fs
+	mov %ax,%gs
+	lss stack_start,%esp
+	call setup_idt
+	call setup_gdt
+	movl $0x10,%eax		# reload all the segment registers
+	mov %ax,%ds		# after changing gdt. CS was already
+	mov %ax,%es		# reloaded in 'setup_gdt'
+	mov %ax,%fs
+	mov %ax,%gs
+	lss stack_start,%esp
+	xorl %eax,%eax
+1:	incl %eax		# check that A20 really IS enabled
+	movl %eax,0x000000	# loop forever if it isn't
+	cmpl %eax,0x100000
+	je 1b
+
+/*
+ * NOTE! 486 should set bit 16, to check for write-protect in supervisor
+ * mode. Then it would be unnecessary with the "verify_area()"-calls.
+ * 486 users probably want to set the NE (#5) bit also, so as to use
+ * int 16 for math errors.
+ */
+	movl %cr0,%eax		# check math chip
+	andl $0x80000011,%eax	# Save PG,PE,ET
+/* "orl $0x10020,%eax" here for 486 might be good */
+	orl $2,%eax		# set MP
+	movl %eax,%cr0
+	call check_x87
+	jmp after_page_tables
+
+/*
+ * We depend on ET to be correct. This checks for 287/387.
+ */
+check_x87:
+	fninit
+	fstsw %ax
+	cmpb $0,%al
+	je 1f			/* no coprocessor: have to set bits */
+	movl %cr0,%eax
+	xorl $6,%eax		/* reset MP, set EM */
+	movl %eax,%cr0
+	ret
+.align 2
+1:	.byte 0xDB,0xE4		/* fsetpm for 287, ignored by 387 */
+	ret
+
+/*
+ *  setup_idt
+ *
+ *  sets up a idt with 256 entries pointing to
+ *  ignore_int, interrupt gates. It then loads
+ *  idt. Everything that wants to install itself
+ *  in the idt-table may do so themselves. Interrupts
+ *  are enabled elsewhere, when we can be relatively
+ *  sure everything is ok. This routine will be over-
+ *  written by the page tables.
+ */
+setup_idt:
+	lea ignore_int,%edx
+	movl $0x00080000,%eax
+	movw %dx,%ax		/* selector = 0x0008 = cs */
+	movw $0x8E00,%dx	/* interrupt gate - dpl=0, present */
+
+	lea idt,%edi
+	mov $256,%ecx
+rp_sidt:
+	movl %eax,(%edi)
+	movl %edx,4(%edi)
+	addl $8,%edi
+	dec %ecx
+	jne rp_sidt
+	lidt idt_descr
+	ret
+
+/*
+ *  setup_gdt
+ *
+ *  This routines sets up a new gdt and loads it.
+ *  Only two entries are currently built, the same
+ *  ones that were built in init.s. The routine
+ *  is VERY complicated at two whole lines, so this
+ *  rather long comment is certainly needed :-).
+ *  This routine will beoverwritten by the page tables.
+ */
+setup_gdt:
+	lgdt gdt_descr
+	ret
+
+/*
+ * I put the kernel page tables right after the page directory,
+ * using 4 of them to span 16 Mb of physical memory. People with
+ * more than 16MB will have to expand this.
+ */
+.org 0x1000
+pg0:
+
+.org 0x2000
+pg1:
+
+.org 0x3000
+pg2:
+
+.org 0x4000
+pg3:
+
+.org 0x5000
+/*
+ * tmp_floppy_area is used by the floppy-driver when DMA cannot
+ * reach to a buffer-block. It needs to be aligned, so that it isn't
+ * on a 64kB border.
+ */
+tmp_floppy_area:
+	.fill 1024,1,0
+
+after_page_tables:
+	pushl $0		# These are the parameters to main :-)
+	pushl $0
+	pushl $0
+	pushl $L6		# return address for main, if it decides to.
+	pushl $main
+	jmp setup_paging
+L6:
+	jmp L6			# main should never return here, but
+				# just in case, we know what happens.
+
+/* This is the default interrupt "handler" :-) */
+int_msg:
+	.asciz "Unknown interrupt\n\r"
+.align 2
+ignore_int:
+	pushl %eax
+	pushl %ecx
+	pushl %edx
+	push %ds
+	push %es
+	push %fs
+	movl $0x10,%eax
+	mov %ax,%ds
+	mov %ax,%es
+	mov %ax,%fs
+	pushl $int_msg
+	call printk
+	popl %eax
+	pop %fs
+	pop %es
+	pop %ds
+	popl %edx
+	popl %ecx
+	popl %eax
+	iret
+
+
+/*
+ * Setup_paging
+ *
+ * This routine sets up paging by setting the page bit
+ * in cr0. The page tables are set up, identity-mapping
+ * the first 16MB. The pager assumes that no illegal
+ * addresses are produced (ie >4Mb on a 4Mb machine).
+ *
+ * NOTE! Although all physical memory should be identity
+ * mapped by this routine, only the kernel page functions
+ * use the >1Mb addresses directly. All "normal" functions
+ * use just the lower 1Mb, or the local data space, which
+ * will be mapped to some other place - mm keeps track of
+ * that.
+ *
+ * For those with more memory than 16 Mb - tough luck. I've
+ * not got it, why should you :-) The source is here. Change
+ * it. (Seriously - it shouldn't be too difficult. Mostly
+ * change some constants etc. I left it at 16Mb, as my machine
+ * even cannot be extended past that (ok, but it was cheap :-)
+ * I've tried to show which constants to change by having
+ * some kind of marker at them (search for "16Mb"), but I
+ * won't guarantee that's all :-( )
+ */
+.align 2
+setup_paging:
+	movl $1024*5,%ecx		/* 5 pages - pg_dir+4 page tables */
+	xorl %eax,%eax
+	xorl %edi,%edi			/* pg_dir is at 0x000 */
+	cld;rep;stosl
+	movl $pg0+7,pg_dir		/* set present bit/user r/w */
+	movl $pg1+7,pg_dir+4		/*  --------- " " --------- */
+	movl $pg2+7,pg_dir+8		/*  --------- " " --------- */
+	movl $pg3+7,pg_dir+12		/*  --------- " " --------- */
+	movl $pg3+4092,%edi
+	movl $0xfff007,%eax		/*  16Mb - 4096 + 7 (r/w user,p) */
+	std
+1:	stosl			/* fill pages backwards - more efficient :-) */
+	subl $0x1000,%eax
+	jge 1b
+	xorl %eax,%eax		/* pg_dir is at 0x0000 */
+	movl %eax,%cr3		/* cr3 - page directory start */
+	movl %cr0,%eax
+	orl $0x80000000,%eax
+	movl %eax,%cr0		/* set paging (PG) bit */
+	ret			/* this also flushes prefetch-queue */
+
+.align 2
+.word 0
+idt_descr:
+	.word 256*8-1		# idt contains 256 entries
+	.long idt
+.align 2
+.word 0
+gdt_descr:
+	.word 256*8-1		# so does gdt (not that that's any
+	.long gdt		# magic number, but it works for me :^)
+
+	.align 8
+idt:	.fill 256,8,0		# idt is uninitialized
+
+gdt:	.quad 0x0000000000000000	/* NULL descriptor */
+	.quad 0x00c09a0000000fff	/* 16Mb */
+	.quad 0x00c0920000000fff	/* 16Mb */
+	.quad 0x0000000000000000	/* TEMPORARY - don't use */
+	.fill 252,8,0			/* space for LDT's and TSS's etc */
